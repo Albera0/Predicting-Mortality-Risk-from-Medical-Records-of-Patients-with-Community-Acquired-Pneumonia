@@ -1,1 +1,6 @@
 /Database/
+# private data
+/data/
+
+# IDE
+/.idea/
