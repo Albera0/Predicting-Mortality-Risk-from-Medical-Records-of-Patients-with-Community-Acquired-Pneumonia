@@ -8,6 +8,7 @@ Feature Prioritization + Encoding + Outlier Cleaning (FIXED)
 
 
 import pandas as pd
+import numpy as np
 from sklearn.impute import SimpleImputer
 
 # Load data
@@ -297,6 +298,13 @@ df_clean = encode_major_criteria_binary(df_clean)
 num_cols = [c for c in continuous_numeric if c in df_clean.columns]
 
 print("Columns to be filled with values：", num_cols)
+
+# Create missing value indicators before imputation
+# This preserves information about which values were originally missing
+for col in num_cols:
+    df_clean[col + "_missing"] = df_clean[col].isna().astype(np.float32)
+
+print(f"Created {len(num_cols)} missing value indicator columns")
 
 imputer = SimpleImputer(strategy="median")
 df_clean[num_cols] = imputer.fit_transform(df_clean[num_cols])
