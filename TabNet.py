@@ -53,16 +53,6 @@ print("Train size:", X_train.shape[0])
 print("Test size :", X_test.shape[0])
 
 
-# Cross-validation setup
-n_splits = 5
-skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-auprc_scores = []
-auroc_scores = []
-
-all_precisions = []
-all_recalls = []
-
 # Build the TablNet model
 def tabnet_like(input_dim, hidden_dim=32, n_steps=2, dropout=0.1, l2_lambda=0.001):
     inputs = Input(shape=(input_dim,))
@@ -91,6 +81,17 @@ def tabnet_like(input_dim, hidden_dim=32, n_steps=2, dropout=0.1, l2_lambda=0.00
     model = Model(inputs, outputs, name="Simplified_TabNet")
     return model
 
+# Cross-validation setup
+n_splits = 5
+N_ENSEMBLE = 3
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+auprc_scores = []
+auroc_scores = []
+
+all_precisions = []
+all_recalls = []
+
 # Cross-validation training
 fold = 1
 plt.figure(figsize=(8,6))
@@ -108,24 +109,31 @@ for train_idx, test_idx in skf.split(X, y):
     )
     class_weights = {0: weights[0], 1: weights[1]}
 
-    model = tabnet_like(X_train.shape[1], hidden_dim=32, n_steps=2, dropout=0.1, l2_lambda=0.001)
-    model.compile(
-        optimizer="adam",
-        loss="binary_crossentropy",
-        metrics=[AUC(name="auroc"), AUC(curve="PR", name="auprc"),
-            Precision(name="precision"), Recall(name="recall")]
-    )
-    #model.summary()
+    ensemble_preds = []
+
+    for e in range(N_ENSEMBLE):
+        print(f"  Training ensemble model {e+1}/{N_ENSEMBLE}")
+        model = tabnet_like(X_train.shape[1], hidden_dim=32, n_steps=2, dropout=0.2, l2_lambda=0.01)
+        model.compile(
+            optimizer="adam",
+            loss="binary_crossentropy",
+            metrics=[AUC(name="auroc"), AUC(curve="PR", name="auprc"),
+                Precision(name="precision"), Recall(name="recall")]
+        )
+        #model.summary()
 
 
-    # Train the model
-    model.fit(X_train, y_train, epochs=100, batch_size=32, class_weight=class_weights, verbose=0)
+        # Train the model
+        model.fit(X_train, y_train, epochs=50, batch_size=32, class_weight=class_weights, verbose=0)
 
-    y_pred = model.predict(X_test).ravel()
+        y_pred = model.predict(X_test).ravel()
+        ensemble_preds.append(y_pred)
+
+    y_pred_mean = np.mean(ensemble_preds, axis=0)
 
     # Evaluate the model
-    auroc = roc_auc_score(y_test, y_pred)
-    precision, recall, _ = precision_recall_curve(y_test, y_pred)
+    auroc = roc_auc_score(y_test, y_pred_mean)
+    precision, recall, _ = precision_recall_curve(y_test, y_pred_mean)
     auprc = auc(recall, precision)
     print(f"Fold {fold} AUROC: {auroc:.3f}, AUPRC: {auprc:.3f}")
 
@@ -158,3 +166,6 @@ plt.grid(True)
 plt.tight_layout()
 plt.savefig("tabnet_pr_curve.png", dpi=300)
 plt.show()
+
+
+
