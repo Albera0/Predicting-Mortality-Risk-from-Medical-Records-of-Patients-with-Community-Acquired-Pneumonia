@@ -8,7 +8,7 @@ df_clean = pd.read_csv("data\\NACef_FINAL_encoded.csv")
 
 target = "gen_hosp_death"
 
-# 只使用结局已知样本
+# Using the data with death outcome known
 df_model = df_clean[df_clean[target].notna()].copy()
 
 X = df_model.drop(columns=["icu_death", "gen_hosp_death"])

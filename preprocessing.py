@@ -302,7 +302,7 @@ imputer = SimpleImputer(strategy="median")
 df_clean[num_cols] = imputer.fit_transform(df_clean[num_cols])
 
 df_clean.to_csv("data/NACef_FINAL_encoded.csv", index=False)
-print("\nfinal form saved：NACef_FINAL_encoded.csv")
+print("\nfinal form saved:NACef_FINAL_encoded.csv")
 print("final dimension:", df_clean.shape)
 
 
