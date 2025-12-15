@@ -2,170 +2,185 @@ import pandas as pd
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
-
-# Split and class weights
 from sklearn.model_selection import train_test_split
 from sklearn.utils import class_weight
-
-
-# TensorFlow/Keras training
-from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, Dropout, Multiply, Add
 from tensorflow.keras.metrics import AUC, Precision, Recall
 from tensorflow.keras import regularizers
+import tensorflow as tf
+from tensorflow.keras import backend as K
+import gc
+K.clear_session()
+gc.collect()
 
-import matplotlib.pyplot as plt
-from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
-
-
-
-# Load the data
+# ========================
+# Load and preprocess data
+# ========================
 DATA_PATH = "Database/NACef_selected_features.csv"
-Targe = "gen_hosp_death"
+TARGET = "gen_hosp_death"
 
+continuous_vars = [
+    "age","hosp_stay","days_ab","admission_sofa","sofa_72",
+    "admission_curb","admission_psi","gold","isolated_micro",
+    "coinfection_microorg","res_pattern","ab_empiric_2"
+]
+
+# Load CSV
 df = pd.read_csv(DATA_PATH)
-Features = [c for c in df.columns if c != Targe]
-df = df[Features + [Targe]].copy()
+features = [c for c in df.columns if c != TARGET]
+df = df[features + [TARGET]].copy()
 
-# Missing values handling
-for col in Features:
+# Identify binary features
+binary_vars = [c for c in df.columns if c not in continuous_vars + [TARGET]]
+
+# Handle missing values
+for col in continuous_vars:
     df[col + "_missing"] = df[col].isna().astype(np.float32)
-    df[col] = df[col].fillna(0)
+df[continuous_vars + binary_vars] = df[continuous_vars + binary_vars].fillna(0)
 
-Features = Features + [c + "_missing" for c in Features]
+# Final features
+features = continuous_vars + binary_vars + [c + "_missing" for c in continuous_vars]
 
 # Train-test split
-X = df[Features].values.astype(np.float32)
-y = df[Targe].values.astype(np.float32)
-
+X = df[features].values.astype(np.float32)
+y = df[TARGET].values.astype(np.float32)
 print("Input shape:", X.shape)
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
-)
+# ========================
+# Sparsemax activation
+# ========================
+class Sparsemax(tf.keras.layers.Layer):
+    def call(self, inputs):
+        z = inputs
+        z_sorted = tf.sort(z, direction="DESCENDING", axis=-1)
+        z_cumsum = tf.cumsum(z_sorted, axis=-1)
 
-print("Train size:", X_train.shape[0])
-print("Test size :", X_test.shape[0])
+        k = tf.range(1, tf.shape(z)[-1] + 1, dtype=z.dtype)
+        k = tf.reshape(k, (1, -1))
 
+        support = tf.cast(1 + k * z_sorted > z_cumsum, z.dtype)
+        k_z = tf.reduce_sum(support, axis=-1, keepdims=True)
 
-# Build the TablNet model
-def tabnet_like(input_dim, hidden_dim=32, n_steps=2, dropout=0.1, l2_lambda=0.001):
+        tau = (tf.reduce_sum(support * z_sorted, axis=-1, keepdims=True) - 1) / k_z
+        return tf.maximum(z - tau, 0.)
+
+# ========================
+# GLU block
+# ========================
+def glu_block(x, units, name):
+    linear = Dense(units, activation=None, name=f"{name}_linear")(x)
+    gate = Dense(units, activation="sigmoid", name=f"{name}_gate")(x)
+    return Multiply(name=f"{name}_glu")([linear, gate])
+
+# ========================
+# Attentive Transformer
+# ========================
+class AttentiveTransformer(tf.keras.layers.Layer):
+    def __init__(self, input_dim, l2_lambda=0.001, gamma=1.5, **kwargs):
+        super().__init__(**kwargs)
+        self.input_dim = input_dim
+        self.gamma = gamma
+        self.dense = Dense(input_dim, kernel_regularizer=regularizers.l2(l2_lambda))
+        self.sparsemax = Sparsemax()
+        # Lambda layer to safely compute mean on KerasTensor
+        self.mean_layer = tf.keras.layers.Lambda(lambda x: tf.reduce_mean(x, axis=0, keepdims=True))
+
+    def call(self, inputs, prior):
+        mask_logits = self.dense(inputs)
+        mean_prior = self.mean_layer(prior)
+        mask = self.sparsemax(mask_logits * mean_prior)
+        new_prior = prior * (self.gamma - mask)
+        masked_features = inputs * mask
+        return masked_features, new_prior
+
+# ========================
+# TabNet-like model
+# ========================
+def tabnet_like(input_dim, hidden_dim=32, n_steps=3, gamma=1.5, dropout=0.2, l2_lambda=0.001):
     inputs = Input(shape=(input_dim,))
-    h = Dense(hidden_dim, activation="relu",
-                kernel_regularizer=tf.keras.regularizers.l2(l2_lambda))(inputs)
-    decisions_list = []
+    x = inputs
 
-    for i in range(n_steps):
-        # Step mask
-        mask = Dense(input_dim, activation="softmax", name=f"mask_{i}")(h)
-        masked = Multiply(name=f"masked_{i}")([inputs, mask])
+    # Feature prior initialized as ones
+    prior = tf.keras.layers.Dense(input_dim, use_bias=False,
+                                    kernel_initializer='ones',
+                                    trainable=False)(x)
 
-        # Decision step
-        decision = Dense(hidden_dim, activation="relu", name=f"decision_{i}")(masked)
-        decision = Dropout(dropout, name=f"dropout_{i}")(decision)
-        decisions_list.append(decision)
-        h = decision
+    # Shared feature transformer layers
+    shared_dense1 = Dense(hidden_dim * 2, activation=None)
+    shared_dense2 = Dense(hidden_dim * 2, activation=None)
 
-    # Aggregate decisions
-    if n_steps > 1:
-        aggregated = Add(name="agg_all")(decisions_list)
-    else:
-        aggregated = decisions_list[0]
+    decision_outputs = []
 
+    for step in range(n_steps):
+        # Attentive Transformer
+        attn_layer = AttentiveTransformer(input_dim, l2_lambda=l2_lambda, gamma=gamma)
+        masked_features, prior = attn_layer(x, prior)
+
+        # Feature Transformer
+        h = shared_dense1(masked_features)
+        h = glu_block(h, hidden_dim, f"shared_glu1_{step}")
+
+        h = shared_dense2(h)
+        h = glu_block(h, hidden_dim, f"shared_glu2_{step}")
+
+        h = Dropout(dropout)(h)
+        decision_outputs.append(h)
+
+    # Aggregate decisions and output
+    aggregated = Add(name="decision_aggregation")(decision_outputs)
     outputs = Dense(1, activation="sigmoid")(aggregated)
-    model = Model(inputs, outputs, name="Simplified_TabNet")
+
+    model = Model(inputs, outputs, name="TabNet_like")
     return model
 
-# Cross-validation setup
-n_splits = 5
-N_ENSEMBLE = 3
-skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+# ========================
+# Single train/test run
+# ========================
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
 
-auprc_scores = []
-auroc_scores = []
+# Compute class weights
+weights = class_weight.compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(y_train),
+    y=y_train
+)
+class_weights = {0: weights[0], 1: weights[1]}
 
-all_precisions = []
-all_recalls = []
-
-# Cross-validation training
-fold = 1
-plt.figure(figsize=(8,6))
-
-for train_idx, test_idx in skf.split(X, y):
-    print(f"\n===== Fold {fold} =====")
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
-    
-    # class weight
-    weights = class_weight.compute_class_weight(
-        class_weight="balanced",
-        classes=np.unique(y_train),
-        y=y_train
-    )
-    class_weights = {0: weights[0], 1: weights[1]}
-
-    ensemble_preds = []
-
-    for e in range(N_ENSEMBLE):
-        print(f"  Training ensemble model {e+1}/{N_ENSEMBLE}")
-        model = tabnet_like(X_train.shape[1], hidden_dim=32, n_steps=2, dropout=0.2, l2_lambda=0.01)
-        model.compile(
-            optimizer="adam",
-            loss="binary_crossentropy",
-            metrics=[AUC(name="auroc"), AUC(curve="PR", name="auprc"),
+# Build model
+model = tabnet_like(X_train.shape[1], hidden_dim=64, n_steps=2, dropout=0.1, gamma=1.5, l2_lambda=0.001)
+model.compile(
+    optimizer="adam",
+    loss="binary_crossentropy",
+    metrics=[AUC(name="auroc"), AUC(curve="PR", name="auprc"),
                 Precision(name="precision"), Recall(name="recall")]
-        )
-        #model.summary()
+)
 
+# Train model
+model.fit(X_train, y_train, epochs=50, batch_size=32, class_weight=class_weights, verbose=1)
 
-        # Train the model
-        model.fit(X_train, y_train, epochs=50, batch_size=32, class_weight=class_weights, verbose=0)
+# Predict
+y_pred = model.predict(X_test).ravel()
 
-        y_pred = model.predict(X_test).ravel()
-        ensemble_preds.append(y_pred)
+# Evaluate
+auroc = roc_auc_score(y_test, y_pred)
+precision, recall, _ = precision_recall_curve(y_test, y_pred)
+auprc = auc(recall, precision)
 
-    y_pred_mean = np.mean(ensemble_preds, axis=0)
+print(f"AUROC: {auroc:.3f}, AUPRC: {auprc:.3f}")
 
-    # Evaluate the model
-    auroc = roc_auc_score(y_test, y_pred_mean)
-    precision, recall, _ = precision_recall_curve(y_test, y_pred_mean)
-    auprc = auc(recall, precision)
-    print(f"Fold {fold} AUROC: {auroc:.3f}, AUPRC: {auprc:.3f}")
-
-    # Store scores
-    auroc_scores.append(auroc)
-    auprc_scores.append(auprc)
-
-    all_precisions.append(np.interp(np.linspace(0,1,100), recall[::-1], precision[::-1]))
-    all_recalls.append(np.linspace(0,1,100))
-    
-    fold += 1
-
-print("\n=== Cross-Validation Summary ===")
-print(f"Mean AUROC: {np.mean(auroc_scores):.3f} ± {np.std(auroc_scores):.3f}")
-print(f"Mean AUPRC: {np.mean(auprc_scores):.3f} ± {np.std(auprc_scores):.3f}")
-
-# Plot curve
-mean_prec = np.mean(all_precisions, axis=0)
-std_prec = np.std(all_precisions, axis=0)
-recall_grid = all_recalls[0]
-
+# Plot Precision-Recall curve
 plt.figure(figsize=(8,6))
-plt.plot(recall_grid, mean_prec, color="blue", label="Mean PR")
-plt.fill_between(recall_grid, mean_prec - std_prec, mean_prec + std_prec, color="blue", alpha=0.2, label="±1 SD")
+plt.plot(recall, precision, color="blue", label="PR curve")
 plt.xlabel("Recall")
 plt.ylabel("Precision")
-plt.title("Cross-Validated Precision-Recall Curve (TabNet-style)")
+plt.title("Precision-Recall Curve (TabNet-style)")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.savefig("tabnet_pr_curve.png", dpi=300)
 plt.show()
-
-
-
