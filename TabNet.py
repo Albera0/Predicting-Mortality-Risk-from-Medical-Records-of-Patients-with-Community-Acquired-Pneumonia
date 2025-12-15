@@ -12,12 +12,12 @@ from tensorflow.keras import regularizers
 import tensorflow as tf
 from tensorflow.keras import backend as K
 import gc
+
 K.clear_session()
 gc.collect()
 
-# ========================
+
 # Load and preprocess data
-# ========================
 DATA_PATH = "Database/NACef_selected_features.csv"
 TARGET = "gen_hosp_death"
 
@@ -48,9 +48,8 @@ X = df[features].values.astype(np.float32)
 y = df[TARGET].values.astype(np.float32)
 print("Input shape:", X.shape)
 
-# ========================
+
 # Sparsemax activation
-# ========================
 class Sparsemax(tf.keras.layers.Layer):
     def call(self, inputs):
         z = inputs
@@ -66,17 +65,15 @@ class Sparsemax(tf.keras.layers.Layer):
         tau = (tf.reduce_sum(support * z_sorted, axis=-1, keepdims=True) - 1) / k_z
         return tf.maximum(z - tau, 0.)
 
-# ========================
+
 # GLU block
-# ========================
 def glu_block(x, units, name):
     linear = Dense(units, activation=None, name=f"{name}_linear")(x)
     gate = Dense(units, activation="sigmoid", name=f"{name}_gate")(x)
     return Multiply(name=f"{name}_glu")([linear, gate])
 
-# ========================
+
 # Attentive Transformer
-# ========================
 class AttentiveTransformer(tf.keras.layers.Layer):
     def __init__(self, input_dim, l2_lambda=0.001, gamma=1.5, **kwargs):
         super().__init__(**kwargs)
@@ -95,9 +92,8 @@ class AttentiveTransformer(tf.keras.layers.Layer):
         masked_features = inputs * mask
         return masked_features, new_prior
 
-# ========================
+
 # TabNet-like model
-# ========================
 def tabnet_like(input_dim, hidden_dim=32, n_steps=3, gamma=1.5, dropout=0.2, l2_lambda=0.001):
     inputs = Input(shape=(input_dim,))
     x = inputs
@@ -135,9 +131,7 @@ def tabnet_like(input_dim, hidden_dim=32, n_steps=3, gamma=1.5, dropout=0.2, l2_
     model = Model(inputs, outputs, name="TabNet_like")
     return model
 
-# ========================
-# Single train/test run
-# ========================
+
 # Split data
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
