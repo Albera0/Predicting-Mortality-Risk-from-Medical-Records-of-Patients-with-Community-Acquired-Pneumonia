@@ -6,7 +6,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils import class_weight
 from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Dropout, Multiply, Add
+from tensorflow.keras.layers import Input, Dense, Dropout, Multiply, Add, BatchNormalization, Concatenate
 from tensorflow.keras.metrics import AUC, Precision, Recall
 from tensorflow.keras import regularizers
 import tensorflow as tf
@@ -92,9 +92,21 @@ class AttentiveTransformer(tf.keras.layers.Layer):
         masked_features = inputs * mask
         return masked_features, new_prior
 
+# Feature Transformer with BN + GLU
+def feature_transformer(x, hidden_dim, name, dropout=0.2):
+    h = Dense(hidden_dim * 2, activation=None, name=f"{name}_dense1")(x)
+    h = BatchNormalization()(h)
+    h = glu_block(h, hidden_dim, f"{name}_glu1")
+
+    h = Dense(hidden_dim * 2, activation=None, name=f"{name}_dense2")(h)
+    h = BatchNormalization()(h)
+    h = glu_block(h, hidden_dim, f"{name}_glu2")
+
+    h = Dropout(dropout)(h)
+    return h
 
 # TabNet-like model
-def tabnet_like(input_dim, hidden_dim=32, n_steps=3, gamma=1.5, dropout=0.2, l2_lambda=0.001):
+def tabnet_like(input_dim, hidden_dim=32, n_steps=3, gamma=1.5, dropout=0.2, l2_lambda=0.001, split_ratio=0.5):
     inputs = Input(shape=(input_dim,))
     x = inputs
 
@@ -103,26 +115,34 @@ def tabnet_like(input_dim, hidden_dim=32, n_steps=3, gamma=1.5, dropout=0.2, l2_
                                     kernel_initializer='ones',
                                     trainable=False)(x)
 
-    # Shared feature transformer layers
-    shared_dense1 = Dense(hidden_dim * 2, activation=None)
-    shared_dense2 = Dense(hidden_dim * 2, activation=None)
-
     decision_outputs = []
 
     for step in range(n_steps):
         # Attentive Transformer
         attn_layer = AttentiveTransformer(input_dim, l2_lambda=l2_lambda, gamma=gamma)
-        masked_features, prior = attn_layer(x, prior)
+        masked_features, prior = attn_layer(inputs, prior)
 
-        # Feature Transformer
-        h = shared_dense1(masked_features)
-        h = glu_block(h, hidden_dim, f"shared_glu1_{step}")
+        # Split features for stability (like TabNet)
+        split_idx = int(input_dim * split_ratio)
+        split1 = masked_features[:, :split_idx]
+        split2 = masked_features[:, split_idx:]
 
-        h = shared_dense2(h)
-        h = glu_block(h, hidden_dim, f"shared_glu2_{step}")
 
+        # Transform splits
+        h1 = feature_transformer(split1, hidden_dim, f"step{step}_split1", dropout)
+        h2 = feature_transformer(split2, hidden_dim, f"step{step}_split2", dropout)
+
+        # Concatenate and append decision
+        h = Concatenate()([h1, h2])
+        decision_outputs.append(h)
+
+        # Concatenate
+        h = Concatenate()([h1, h2])
         h = Dropout(dropout)(h)
         decision_outputs.append(h)
+
+        # Next step input
+        x = h
 
     # Aggregate decisions and output
     aggregated = Add(name="decision_aggregation")(decision_outputs)
@@ -146,7 +166,7 @@ weights = class_weight.compute_class_weight(
 class_weights = {0: weights[0], 1: weights[1]}
 
 # Build model
-model = tabnet_like(X_train.shape[1], hidden_dim=64, n_steps=2, dropout=0.1, gamma=1.5, l2_lambda=0.001)
+model = tabnet_like(X_train.shape[1], hidden_dim=64, n_steps=2, dropout=0.1, gamma=1.5, l2_lambda=0.001, split_ratio=0.5)
 model.compile(
     optimizer="adam",
     loss="binary_crossentropy",
